@@ -1,0 +1,481 @@
+import cv2
+import numpy as np
+import os
+
+
+# LUT 생성 함수
+def make_LUT(hist_in):
+    cdf = hist_in.cumsum()
+    cdf_min = cdf[cdf > 0].min()
+    cdf_max = cdf.max()
+    cdf_norm = (cdf - cdf_min) / (cdf_max - cdf_min + 1e-5) * 255
+    LUT = ((cdf_norm - cdf_norm.min()) / (cdf_norm.max() - cdf_norm.min() + 1e-5) * 255).astype(np.uint8)
+    return LUT
+
+
+# 타일별 LUT 처리 함수
+def process_LUT_tiles(gray_img, clipLimit, tileGridSize, blend_ratio_map):
+    h, w = gray_img.shape
+    tiles_y, tiles_x = tileGridSize
+    tile_h = h // tiles_y
+    tile_w = w // tiles_x
+
+    LUT_tiles = [[None for _ in range(tiles_x)] for _ in range(tiles_y)]
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            y0 = ty * tile_h
+            x0 = tx * tile_w
+            y1 = min((ty + 1) * tile_h, h)
+            x1 = min((tx + 1) * tile_w, w)
+            tile = gray_img[y0:y1, x0:x1]
+
+            if tile.size < 64:
+                LUT_tiles[ty][tx] = np.arange(256, dtype=np.uint8)
+                continue
+
+            hist = cv2.calcHist([tile], [0], None, [256], [0, 256]).flatten()
+            threshold = int(clipLimit * tile.size / 256)
+            threshold = max(threshold, 1)
+            excess = np.maximum(hist - threshold, 0)
+            hist -= excess
+            remaining_excess = excess.sum()
+
+            hist_uniform = hist.copy()
+            uniform_add = remaining_excess // 256
+            hist_uniform += uniform_add
+            rem = int(remaining_excess - uniform_add * 256)
+            if rem > 0:
+                nonzero_bins = np.where(hist_uniform > 0)[0]
+                if len(nonzero_bins) > 0:
+                    chosen_bins = np.random.choice(nonzero_bins, size=rem, replace=True)
+                    for b in chosen_bins:
+                        hist_uniform[b] += 1
+            hist_uniform = np.clip(hist_uniform, 0, 255)
+
+            hist_weighted = hist.copy()
+            valid_bins = hist_weighted > 0
+            rem_ex = remaining_excess
+            while rem_ex > 0:
+                num_bins = np.count_nonzero(valid_bins)
+                if num_bins == 0:
+                    break
+                distribution_formula = (hist_weighted / tile.size) * (1 / max(num_bins, 1)) * (
+                        np.array(
+                            [hist_weighted[max(0, i - 10):min(255, i + 10) + 1].sum() for i in range(256)]) / tile.size
+                ) * rem_ex
+                priority = np.zeros_like(hist_weighted, dtype=int)
+                for i in range(256):
+                    if valid_bins[i]:
+                        weight = 1.0 if i < 128 else 0.5
+                        priority[i] = np.round(distribution_formula[i] * weight).astype(int)
+                add_sum = priority.sum()
+                if add_sum == 0:
+                    break
+                hist_weighted += priority
+                rem_ex -= add_sum
+
+            LUT_uniform = make_LUT(hist_uniform)
+            LUT_weighted = make_LUT(hist_weighted)
+
+            blend_ratio = blend_ratio_map[ty][tx]
+            LUT = (blend_ratio * LUT_uniform + (1 - blend_ratio) * LUT_weighted).astype(np.uint8)
+            LUT_tiles[ty][tx] = LUT
+
+    return LUT_tiles
+
+
+# LUT 보간 적용 함수
+def bilinear_interpolate_LUT(gray_img, LUT_tiles, tileGridSize):
+    h, w = gray_img.shape
+    tiles_y, tiles_x = tileGridSize
+    tile_h_float = h / tiles_y if tiles_y > 0 else float(h)
+    tile_w_float = w / tiles_x if tiles_x > 0 else float(w)
+    if tile_h_float < 1e-5: tile_h_float = 1e-5
+    if tile_w_float < 1e-5: tile_w_float = 1e-5
+    out = np.zeros_like(gray_img, dtype=np.uint8)
+    for i in range(h):
+        for j in range(w):
+            fy = i / tile_h_float - 0.5
+            fx = j / tile_w_float - 0.5
+            y0 = int(np.floor(fy))
+            x0 = int(np.floor(fx))
+            y1 = y0 + 1
+            x1 = x0 + 1
+            wy = fy - y0
+            wx = fx - x0
+
+            def get_LUT_value(ty_idx, tx_idx, pix_val):
+                ty_idx = np.clip(ty_idx, 0, tiles_y - 1)
+                tx_idx = np.clip(tx_idx, 0, tiles_x - 1)
+                lut = LUT_tiles[ty_idx][tx_idx]
+                if lut is not None:
+                    return lut[np.clip(pix_val, 0, 255)]
+                return pix_val
+
+            pix_val = gray_img[i, j]
+            v00 = get_LUT_value(y0, x0, pix_val)
+            v01 = get_LUT_value(y0, x1, pix_val)
+            v10 = get_LUT_value(y1, x0, pix_val)
+            v11 = get_LUT_value(y1, x1, pix_val)
+            top = (1.0 - wx) * float(v00) + wx * float(v01)
+            bottom = (1.0 - wx) * float(v10) + wx * float(v11)
+            blended = (1.0 - wy) * top + wy * bottom
+            out[i, j] = np.clip(round(blended), 0, 255).astype(np.uint8)
+    return out
+
+
+#  배경 복원 및 연속성 보정
+def restore_background_and_smooth(original_img, enhanced_img):
+    """
+    배경 영역을 원본으로 복원하고 불연속성을 보정하는 함수
+    """
+    print("    Starting background restoration and smoothing...")
+
+    h, w = original_img.shape
+    result = enhanced_img.copy().astype(np.float32)
+    original_float = original_img.astype(np.float32)
+    enhanced_float = enhanced_img.astype(np.float32)
+
+    # 1단계: 배경 영역 식별 및 복원
+    print("      Phase 1: Identifying and restoring background areas...")
+
+    # 밝기 변화량 계산 (원본 - 변환후 > 0인 어두워진 영역)
+    brightness_diff = original_float - enhanced_float
+    darkened_mask = brightness_diff > 0
+
+    # 24개 이웃 픽셀과의 밝기 차이 계산 (5x5 윈도우에서 중심 제외)
+    kernel_5x5 = np.ones((5, 5), dtype=np.float32) / 24
+    kernel_5x5[2, 2] = 0  # 중심 픽셀 제외
+
+    # 원본 이미지에서 각 픽셀의 이웃 평균 계산
+    neighbor_avg = cv2.filter2D(original_float, -1, kernel_5x5)
+
+    # 각 픽셀과 이웃들과의 차이 (완만함 정도)
+    smoothness = np.abs(original_float - neighbor_avg)
+
+    # 배경 기준: 어두워졌으면서 + 주변과 완만한 영역
+    smoothness_threshold = np.percentile(smoothness, 75)  # 상위 25%는 디테일로 간주
+    background_mask = darkened_mask & (smoothness < smoothness_threshold)
+
+    # 배경 영역을 원본으로 복원
+    result[background_mask] = original_float[background_mask]
+
+    print(f"      Restored {np.sum(background_mask)} background pixels")
+
+    # 2단계: 불연속성 보정 (9개 이웃 고려한 스무딩)
+    print("      Phase 2: Smoothing discontinuities...")
+
+    # 3x3 가우시안 커널로 부드럽게 보정
+    gaussian_kernel = cv2.getGaussianKernel(3, 0.8)
+    gaussian_2d = gaussian_kernel * gaussian_kernel.T
+
+    # 변경된 픽셀 주변의 불연속성 감지
+    # Sobel 연산자로 경계 감지
+    sobelx = cv2.Sobel(result, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(result, cv2.CV_64F, 0, 1, ksize=3)
+    edge_magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
+
+    # 강한 경계에서는 스무딩 적용
+    edge_threshold = np.percentile(edge_magnitude, 85)
+    strong_edge_mask = edge_magnitude > edge_threshold
+
+    # 강한 경계 영역에만 선택적 스무딩 적용
+    smoothed = cv2.filter2D(result, -1, gaussian_2d)
+
+    # 스무딩 강도를 거리에 따라 조절
+    for i in range(h):
+        for j in range(w):
+            if strong_edge_mask[i, j]:
+                # 주변 9개 픽셀의 변화량 확인
+                window_size = 1
+                y_start = max(0, i - window_size)
+                y_end = min(h, i + window_size + 1)
+                x_start = max(0, j - window_size)
+                x_end = min(w, j + window_size + 1)
+
+                # 주변 영역의 변화량 계산
+                local_diff = np.abs(result[y_start:y_end, x_start:x_end] -
+                                    original_float[y_start:y_end, x_start:x_end])
+                avg_local_change = np.mean(local_diff)
+
+                # 변화량이 큰 경우 더 강한 스무딩 적용
+                if avg_local_change > 10:  # 임계값
+                    blend_ratio = min(0.7, avg_local_change / 30)
+                    result[i, j] = (1 - blend_ratio) * result[i, j] + blend_ratio * smoothed[i, j]
+
+    # 3단계: 전체적인 경계 부드럽게 처리
+    print("      Phase 3: Final edge smoothing...")
+
+    # 배경 복원 경계에서의 부드러운 전환
+    background_edges = cv2.morphologyEx(background_mask.astype(np.uint8),
+                                        cv2.MORPH_GRADIENT,
+                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+    # 경계에서 가중 평균으로 부드럽게 연결
+    for i in range(h):
+        for j in range(w):
+            if background_edges[i, j] > 0:
+                # 3x3 윈도우에서 가중 평균
+                y_start = max(0, i - 1)
+                y_end = min(h, i + 2)
+                x_start = max(0, j - 1)
+                x_end = min(w, j + 2)
+
+                window = result[y_start:y_end, x_start:x_end]
+                weights = gaussian_2d[:window.shape[0], :window.shape[1]]
+
+                weighted_avg = np.sum(window * weights) / np.sum(weights)
+                result[i, j] = 0.6 * result[i, j] + 0.4 * weighted_avg
+
+    result_uint8 = np.clip(result, 0, 255).astype(np.uint8)
+
+    print(f"    Background restoration and smoothing complete.")
+    print(f"      Background pixels restored: {np.sum(background_mask)}")
+    print(f"      Edge pixels smoothed: {np.sum(strong_edge_mask)}")
+
+    return result_uint8
+
+
+# CLAHE 메인 함수
+def CLAHE_manual_no_interp(gray_img, clipLimit, tileGridSize, force_weighted=False):
+    h, w = gray_img.shape
+    tiles_y, tiles_x = tileGridSize
+    tile_h = h // tiles_y
+    tile_w = w // tiles_x
+
+    mean_brightness_map = np.zeros((tiles_y, tiles_x), dtype=np.float32)
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            y0, x0 = ty * tile_h, tx * tile_w
+            tile = gray_img[y0:y0 + tile_h, x0:x0 + tile_w]
+            mean_brightness_map[ty, tx] = np.mean(tile)
+
+    mean_brightness_avg = np.mean(gray_img)
+    print(f"Mean Brightness Average (Global): {mean_brightness_avg}")
+
+    def sigmoid(x, k=0.2, x0=mean_brightness_avg):
+        return 1 / (1 + np.exp(-k * (x - x0)))
+
+    if force_weighted:
+        blend_map = np.zeros_like(mean_brightness_map)
+    else:
+        blend_map = sigmoid(mean_brightness_map, k=0.2, x0=mean_brightness_avg)
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            if blend_map[ty, tx] >= 0.8:
+                total_weight = 0
+                count = 0
+                for dy in [-1, 0, 1]:
+                    for dx in [-1, 0, 1]:
+                        ny, nx = ty + dy, tx + dx
+                        if 0 <= ny < tiles_y and 0 <= nx < tiles_x:
+                            if (dy != 0 or dx != 0):
+                                neighbor_ratio = blend_map[ny, nx]
+                                distance = max(abs(dy), abs(dx))
+                                weight = (1.0 / distance)
+                                total_weight += (1.0 - neighbor_ratio) * weight
+                                count += weight
+                if count > 0 and total_weight / count > 0.5:
+                    blend_map[ty, tx] = max(0.3, 1.0 - total_weight / count)
+
+    LUT_tiles = process_LUT_tiles(gray_img, clipLimit, tileGridSize, blend_map)
+    out = bilinear_interpolate_LUT(gray_img, LUT_tiles, tileGridSize)
+
+    # 🔥 새로운 단계: 배경 복원 및 연속성 보정 적용
+    out_corrected = restore_background_and_smooth(gray_img, out)
+
+    return out_corrected
+
+
+def apply_color_restoration(img_bgr, enhanced_L):
+    """
+    전체 영역에 ratio 기반 색상 복원을 수행하는 함수
+
+    Args:
+        img_bgr: 원본 BGR 이미지
+        enhanced_L: 향상된 L 채널 (밝기 채널)
+
+    Returns:
+        ratio_gaussian_result, full_result: (ratio+가우시안 결과, ratio+CRF+가우시안 결과)
+    """
+    print("    Starting enhanced color restoration...")
+    if img_bgr is None or enhanced_L is None:
+        print("    Warning: Input for color restoration is empty.")
+        return img_bgr, img_bgr
+    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
+        print("    Warning: img_bgr for color restoration is not a 3-channel image.")
+        return img_bgr, img_bgr
+    if enhanced_L.ndim != 2:
+        print("    Warning: enhanced_L for color restoration is not a 2-channel image.")
+        return img_bgr, img_bgr
+
+    print("      Converting to LAB color space...")
+    Lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L_orig, a, b = cv2.split(Lab)
+
+    if enhanced_L.shape != L_orig.shape:
+        print(f"      Resizing enhanced_L from {enhanced_L.shape} to {L_orig.shape}")
+        enhanced_L = cv2.resize(enhanced_L, (L_orig.shape[1], L_orig.shape[0]))
+
+    # Step 1: 전체 영역에 ratio 기반 채도 향상 적용
+    print("      Applying ratio-based chroma enhancement for entire image...")
+
+    # signed a,b로 변환하고 chroma 계산
+    a_f = a.astype(np.float32) - 128.0
+    b_f = b.astype(np.float32) - 128.0
+    C = np.sqrt(a_f ** 2 + b_f ** 2)  # 원래 채도
+
+    out_f_01 = enhanced_L.astype(np.float32) / 255.0
+    L_orig_f_01 = L_orig.astype(np.float32) / 255.0
+
+    # ratio 계산 및 클리핑 (전체 영역)
+    ratio = out_f_01 / (L_orig_f_01 + 1e-8)
+
+    # 어두운 영역(원본 밝기 20 이하)과 나머지 영역 구분
+    dark_original_mask = L_orig <= 20
+    other_mask = L_orig > 20
+
+    # 어두운 영역: 2.0~2.5 클리핑
+    ratio[dark_original_mask] = np.clip(ratio[dark_original_mask], 2.5, 3.0)
+
+    # 나머지 영역: 1.5~2.5 클리핑
+    ratio[other_mask] = np.clip(ratio[other_mask], 0.5, 1.5)
+
+    # new_chroma = 원래 C × ratio
+    C_new = C * ratio
+    scale = C_new / (C + 1e-8)
+
+    # 전체 영역에 적용
+    a_enhanced = (a_f * scale + 128.0).clip(0, 255).astype(np.uint8)
+    b_enhanced = (b_f * scale + 128.0).clip(0, 255).astype(np.uint8)
+
+    # ratio만 적용한 LAB 이미지 생성
+    ratio_only_Lab = cv2.merge([enhanced_L, a_enhanced, b_enhanced])
+    ratio_only_BGR = cv2.cvtColor(ratio_only_Lab, cv2.COLOR_LAB2BGR)
+    print("      Ratio-based chroma enhancement complete.")
+
+    # Step 2: ratio + 가우시안 오프셋 적용 (첫 번째 저장용)
+    print("      Applying asymmetric Gaussian offset to ratio result...")
+
+    L_offset_target = enhanced_L.astype(np.float64)
+    A = 20.0
+    mu = 90.0
+    sigma_left = 30.0
+    sigma_right = 50.0
+
+    # 가우시안 오프셋 LUT 생성
+    offset_lut = np.zeros(256, dtype=np.float64)
+    for i_val in range(256):
+        L_val_current = float(i_val)
+        if L_val_current < mu:
+            offset_lut[i_val] = A * np.exp(-((L_val_current - mu) ** 2) / (2.0 * sigma_left ** 2))
+        else:
+            offset_lut[i_val] = A * np.exp(-((L_val_current - mu) ** 2) / (2.0 * sigma_right ** 2))
+
+    # 가우시안 오프셋 적용
+    L_adjusted_by_offset = L_offset_target + offset_lut[enhanced_L.astype(np.uint8)]
+    L_adjusted_by_offset = np.clip(L_adjusted_by_offset, 0, 255).astype(np.uint8)
+
+    # ratio + 가우시안 결과 생성
+    ratio_gaussian_Lab = cv2.merge((L_adjusted_by_offset, a_enhanced, b_enhanced))
+    ratio_gaussian_BGR = cv2.cvtColor(ratio_gaussian_Lab, cv2.COLOR_LAB2BGR)
+    print("      Ratio + Gaussian offset complete.")
+
+    # Step 3: CRF 기반 색상 보정 추가 적용 (두 번째 저장용)
+    print("      Applying CRF-based color correction...")
+    img_float = img_bgr.astype(np.float64) + 1.0
+    sum_img_float = np.sum(img_float, axis=2, keepdims=True)
+    sum_img_float[sum_img_float < 1e-5] = 1e-5
+    term1 = 125.0 * img_float
+    term2 = sum_img_float
+    term1[term1 < 1e-5] = 1e-5
+
+    log_term1 = np.log(term1)
+    log_term2 = np.log(term2)
+
+    crf = 46.0 * (log_term1 - log_term2)
+    enhanced_BGR_crf_float = ratio_only_BGR.astype(np.float64) * crf
+
+    min_val_crf = np.min(enhanced_BGR_crf_float)
+    max_val_crf = np.max(enhanced_BGR_crf_float)
+    range_crf = max_val_crf - min_val_crf
+
+    if range_crf > 1e-5:
+        enhanced_BGR_crf = 255.0 * (enhanced_BGR_crf_float - min_val_crf) / range_crf
+    else:
+        enhanced_BGR_crf = np.full_like(enhanced_BGR_crf_float, np.clip(min_val_crf, 0, 255))
+    enhanced_BGR_crf = np.clip(enhanced_BGR_crf, 0, 255).astype(np.uint8)
+    print("      CRF-based color correction complete.")
+
+    # Step 4: CRF 결과에도 가우시안 오프셋 적용
+    print("      Applying asymmetric Gaussian offset to CRF result...")
+    Lab_final_crf = cv2.cvtColor(enhanced_BGR_crf, cv2.COLOR_BGR2LAB)
+    L_from_crf, a_final, b_final = cv2.split(Lab_final_crf)
+
+    # CRF 결과에 가우시안 오프셋 적용
+    L_crf_with_offset = L_offset_target + offset_lut[enhanced_L.astype(np.uint8)]
+    L_crf_with_offset = np.clip(L_crf_with_offset, 0, 255).astype(np.uint8)
+
+    # 최종 결과 생성 (ratio + CRF + 가우시안)
+    final_result_Lab = cv2.merge((L_crf_with_offset, a_final, b_final))
+    final_result_bgr = cv2.cvtColor(final_result_Lab, cv2.COLOR_LAB2BGR)
+
+    print("    Enhanced color restoration complete.")
+    return ratio_gaussian_BGR, final_result_bgr
+
+
+# 멀티스케일 처리 및 저장 함수
+def process_multiscale(img_bgr, output_folder, image_name):
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    scales = [(4, 4, 1), (8, 8, 2), (16, 16, 3)]
+    interpolated_results = []
+
+    for tile_size, clip_limit, scale in scales:
+        force_weighted = (tile_size == 4)
+        out_no_interp = CLAHE_manual_no_interp(img_gray, clipLimit=clip_limit, tileGridSize=(tile_size, tile_size),
+                                               force_weighted=force_weighted)
+        out_interp = cv2.resize(out_no_interp, (img_gray.shape[1], img_gray.shape[0]), interpolation=cv2.INTER_LINEAR)
+        interpolated_results.append(out_interp.astype(np.float32))
+
+    final_merged = np.mean(interpolated_results, axis=0)
+    final_merged = np.clip(final_merged, 0, 255).astype(np.uint8)
+
+    # 색상 복원 수행 (2개 결과 반환)
+    ratio_gaussian_result, full_result = apply_color_restoration(img_bgr, final_merged)
+
+    # 최종 결과만 저장
+    final_name = f"!!ver2_{image_name}"
+
+    cv2.imwrite(os.path.join(output_folder, final_name), full_result)
+
+    print(f"    Saved: {final_name} (ratio + CRF + gaussian)")
+
+
+# 메인 함수
+def main():
+    input_folder = r"C:\jins\allmain"
+    output_folder = r"C:\jins\color"
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    image_extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+    image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(image_extensions)]
+
+    for image_file in image_files:
+        input_path = os.path.join(input_folder, image_file)
+        img_bgr = cv2.imread(input_path, cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            print(f"입력 이미지 읽기 완료: {image_file}")
+            process_multiscale(img_bgr, output_folder, image_file)
+            print(f"이미지 처리 완료: {image_file}")
+        else:
+            print(f"이미지 읽기 실패: {image_file}")
+
+    print("\n🎉 모든 이미지 처리 완료!")
+
+
+if __name__ == "__main__":
+    main()
