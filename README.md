@@ -1,62 +1,50 @@
-HDR Toolbox
-===========
+# REAL_MY_FINAL_CODE
 
-HDR Toolbox is a MATLAB/Octave toolbox for processing High Dynamic Range (HDR) content.
+This repository contains the codes used in the following paper:
 
-Author: Francesco Banterle
+> Jin, Seong-Hyun; Son, Dong-Min; Lee, Seung-Hwan; Go, Young-Ho; Lee, Sung-Hak.
+> **Enhancing Local Contrast in Low-Light Images: A Multiscale Model with Adaptive Redistribution of Histogram Excess.**
+> *Mathematics* 2025, 13, no. 20: 3282.
+> https://doi.org/10.3390/math13203282
 
-License: This software is distributed under GPL v3 license (see license.txt)
+## Code Structure
 
-Year: Fall 2010-2015
+### MATLAB
+- L1L0
+- iCAM06
+- Reinhard
+- Kwon
 
-Title: HDR Toolbox for Matlab
+### Python
+- All other methods
 
-Version: 1.0.7
+## Requirements
 
-Contact:
-========
-e-mail: support@advancedhdrbook.com
+### MATLAB codes
+- MATLAB (R2014b or higher recommended)
 
-facebook: https://www.facebook.com/pages/Advanced-High-Dynamic-Range-Imaging-Book/166905003358276
+### Python codes
+- Python 3.x
+- PyTorch
+- torchvision
+- numpy
 
+## Citation
 
-HOW TO INSTALL:
-===============
-1) Unzip the file HDRToolbox.zip in a FOLDER on your PC/MAC
-
-2) Run Matlab
-
-3) Set the FOLDER as current directory
-
-4) Write the command installHDRToolbox in the Command Window, and wait for the installation process to end.
-
-
-NOTE ON TONE MAPPING:
-=====================
-The majority of TMOs return tone mapped images with linear values. This means that gamma encoding
-needs to be applied to the output of these TMOs before visualization or before writing tone mapped images
- on the disk; otherwise these images may appear dark.
-A few operators (e.g. Mertens et al.'s operator) return gamma encoded values,
-so there is no need to apply gamma to them; in this case a message (e.g. a Warning) is displayed
-after tone mapping alerting that there is no need of gamma encoding.
-
-
-REFERENCE:
-==========
-Please reference the book in your work or papers if you use this toolbox:
-
-@book{Banterle:2011,
-
-author = {Banterle, Francesco and Artusi, Alessandro and Debattista, Kurt and Chalmers, Alan},
-
-title = {Advanced High Dynamic Range Imaging: Theory and Practice},
-
-year = {2011},
-
-isbn = {9781568817194},
-
-publisher = {AK Peters (CRC Press)},
-
-address = {Natick, MA, USA},
-
+If you use this code in your research, please cite our paper:
+```bibtex
+@article{jin2025enhancing,
+  title={Enhancing Local Contrast in Low-Light Images: A Multiscale Model with Adaptive Redistribution of Histogram Excess},
+  author={Jin, Seong-Hyun and Son, Dong-Min and Lee, Seung-Hwan and Go, Young-Ho and Lee, Sung-Hak},
+  journal={Mathematics},
+  volume={13},
+  number={20},
+  pages={3282},
+  year={2025},
+  doi={10.3390/math13203282}
 }
+```
+
+## Contact
+
+If you have any questions, feel free to open an issue.
