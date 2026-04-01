@@ -1,0 +1,73 @@
+import cv2
+import numpy as np
+import os
+from tqdm import tqdm
+
+# 컬러 복원 함수
+def apply_color_restoration(img_bgr, enhanced_L):
+    Lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(Lab)
+    restored_Lab = cv2.merge((enhanced_L, a, b))
+    restored_BGR = cv2.cvtColor(restored_Lab, cv2.COLOR_LAB2BGR)
+
+    img_float = img_bgr.astype(np.float64) + 1.0
+    crf = 46 * (np.log10(125 * img_float) - np.log10(np.sum(img_float, axis=2, keepdims=True)))
+
+    restored_BGR_crf = restored_BGR * crf
+    restored_BGR_crf = 192 * (restored_BGR_crf - (-30))
+    restored_BGR_crf = 255 * (restored_BGR_crf - np.min(restored_BGR_crf)) / (np.max(restored_BGR_crf) - np.min(restored_BGR_crf))
+    restored_BGR_crf = np.uint8(np.clip(restored_BGR_crf, 0, 255))
+
+    Lab_final = cv2.cvtColor(restored_BGR_crf, cv2.COLOR_BGR2LAB)
+    L_final, a_final, b_final = cv2.split(Lab_final)
+    final_result = cv2.merge((enhanced_L, a_final, b_final))
+    final_result_bgr = cv2.cvtColor(final_result, cv2.COLOR_LAB2BGR)
+
+    return final_result_bgr
+
+# 멀티스케일 CLAHE + 컬러 복원 처리 함수
+def process_multiscale_clahe(img_bgr, output_folder, image_name):
+    # LAB 변환
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(img_lab)
+
+    # 스케일별 CLAHE
+    scales = [(4, 4, 1), (8, 8, 2), (16, 16, 3)]
+    enhanced_L_list = []
+
+    for tile_size, clip_limit, _ in scales:
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+        enhanced_L = clahe.apply(L)
+        enhanced_L_list.append(enhanced_L.astype(np.float32))
+
+    # 스케일별 결과 평균
+    merged_enhanced_L = np.mean(enhanced_L_list, axis=0)
+    merged_enhanced_L = np.clip(merged_enhanced_L, 0, 255).astype(np.uint8)
+
+    # 컬러 복원
+    color_restored_result = apply_color_restoration(img_bgr, merged_enhanced_L)
+
+    # 저장
+    output_name = f"opencv_multi_{image_name}"
+    cv2.imwrite(os.path.join(output_folder, output_name), color_restored_result)
+
+# 메인 함수
+def main():
+    input_folder = r"C:\jins\main2"
+    output_folder = r"C:\opencv\5mon\final"
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    image_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+
+    for filename in tqdm(image_files, desc="Processing images"):
+        input_path = os.path.join(input_folder, filename)
+        img_bgr = cv2.imread(input_path)
+
+        if img_bgr is not None:
+            process_multiscale_clahe(img_bgr, output_folder, filename)
+        else:
+            print(f"Error loading image: {input_path}")
+
+if __name__ == "__main__":
+    main()
